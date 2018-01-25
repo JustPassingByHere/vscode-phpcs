@@ -5,32 +5,41 @@
 "use strict";
 
 import {
-	TextDocumentIdentifier, TextDocumentChangeEvent
-} from 'vscode-languageserver-types';
-
-import {
-	IPCMessageReader, IPCMessageWriter,
 	createConnection, IConnection,
 	TextDocuments, TextDocument,
-	InitializeParams, InitializeResult,
+	InitializeResult,
 	DidChangeConfigurationParams, DidChangeWatchedFilesParams,
-	PublishDiagnosticsParams, Files,
+	PublishDiagnosticsParams, Files, ProposedFeatures, Proposed, TextDocumentChangeEvent, TextDocumentIdentifier
 } from 'vscode-languageserver';
 
 import * as proto from "./protocol";
-import { PhpcsLinter, PhpcsPathResolver } from "./linter";
+import { PhpcsLinter } from "./linter";
 import { PhpcsSettings } from "./settings";
 import { StringResources as SR } from "./helpers/strings";
 
 class PhpcsServer {
 
 	private connection: IConnection;
-	private settings: PhpcsSettings;
-	private ready: boolean = false;
 	private documents: TextDocuments;
-	private linter: PhpcsLinter;
-	private workspacePath: string;
 	private validating: Map<string, TextDocument>;
+
+	// Cache the settings of all open documents
+	private hasConfigurationCapability: boolean = false;
+	private hasWorkspaceFolderCapability: boolean = false;
+
+	private globalSettings: PhpcsSettings;
+	private defaultSettings: PhpcsSettings = {
+		enable: true,
+		executablePath: null,
+		composerJsonPath: null,
+		standard: null,
+		showSources: false,
+		showWarnings: true,
+		ignorePatterns: [],
+		warningSeverity: 5,
+		errorSeverity: 5,
+	};
+	private documentSettings: Map<string, Promise<PhpcsSettings>> = new Map();
 
 	/**
 	 * Class constructor.
@@ -39,10 +48,11 @@ class PhpcsServer {
 	 */
 	constructor() {
 		this.validating = new Map();
-		this.connection = createConnection(new IPCMessageReader(process), new IPCMessageWriter(process));
+		this.connection = createConnection(ProposedFeatures.all);
 		this.documents = new TextDocuments();
 		this.documents.listen(this.connection);
 		this.connection.onInitialize(this.safeEventHandler(this.onInitialize));
+		this.connection.onInitialized(this.safeEventHandler(this.onDidInitialize));
 		this.connection.onDidChangeConfiguration(this.safeEventHandler(this.onDidChangeConfiguration));
 		this.connection.onDidChangeWatchedFiles(this.safeEventHandler(this.onDidChangeWatchedFiles));
 		this.documents.onDidChangeContent(this.safeEventHandler(this.onDidChangeDocument));
@@ -69,10 +79,35 @@ class PhpcsServer {
 	 * @param params The initialization parameters.
 	 * @return A promise of initialization result or initialization error.
 	 */
-	private async onInitialize(params: InitializeParams): Promise<InitializeResult> {
-		this.workspacePath = params.rootPath;
-		let result: InitializeResult = { capabilities: { textDocumentSync: this.documents.syncKind } };
-		return result;
+	private async onInitialize(params: any): Promise<InitializeResult> {
+		let capabilities = params.capabilities;
+
+		// Does the client support the `workspace/configuration` request?
+		// If not, we will fall back using global settings
+		this.hasWorkspaceFolderCapability = (capabilities as Proposed.WorkspaceFoldersClientCapabilities).workspace && !!(capabilities as Proposed.WorkspaceFoldersClientCapabilities).workspace.workspaceFolders;
+		this.hasConfigurationCapability = (capabilities as Proposed.ConfigurationClientCapabilities).workspace && !!(capabilities as Proposed.ConfigurationClientCapabilities).workspace.configuration;
+
+		if (this.hasWorkspaceFolderCapability) {
+			let folders = (params as Proposed.WorkspaceFoldersInitializeParams).workspaceFolders;
+			this.connection.tracer.log(SR.format("Initialize Folders: {0}", folders.map(f => { return f.name; }).join()));
+		}
+
+		return Promise.resolve<InitializeResult>({
+			capabilities: {
+				textDocumentSync: this.documents.syncKind
+			}
+		});
+	}
+
+	/**
+	 * Handles connection initialization completion.
+	 */
+	private async onDidInitialize(): Promise<void> {
+		if (this.hasWorkspaceFolderCapability) {
+			(this.connection.workspace as any).onDidChangeWorkspaceFolders((_event: Proposed.WorkspaceFoldersChangeEvent) => {
+				this.connection.tracer.log('Workspace folder change event received');
+			});
+		}
 	}
 
 	/**
@@ -82,8 +117,26 @@ class PhpcsServer {
 	 * @return void
 	 */
 	private async onDidChangeConfiguration(params: DidChangeConfigurationParams): Promise<void> {
-		this.settings = params.settings.phpcs;
-		await this.initializeLinter();
+		if (this.hasConfigurationCapability) {
+			// Reset all cached document settings
+			this.documentSettings.clear();
+		} else {
+			this.globalSettings = params.settings.phpcs as PhpcsSettings || this.defaultSettings;
+		}
+
+		await this.validateMany(this.documents.all());
+	}
+
+	private async getDocumentSettings(resource: string): Promise<PhpcsSettings> {
+		if (!this.hasConfigurationCapability) {
+			return Promise.resolve(this.globalSettings);
+		}
+		let result = this.documentSettings.get(resource);
+		if (!result) {
+			result = (this.connection.workspace as any).getConfiguration({ scopeUri: resource });
+			this.documentSettings.set(resource, result);
+		}
+		return result;
 	}
 
 	/**
@@ -134,35 +187,6 @@ class PhpcsServer {
 	 */
 	private async onDidChangeDocument(event: TextDocumentChangeEvent ): Promise<void> {
 		await this.validateSingle(event.document);
-	}
-
-	/**
-	 * Initialize linter instance.
-	 */
-	private async initializeLinter() {
-		try {
-			let executablePath = this.settings.executablePath;
-			if (executablePath === null) {
-				let executablePathResolver = new PhpcsPathResolver(this.workspacePath, this.settings);
-				executablePath = await executablePathResolver.resolve();
-			}
-
-			this.linter = await PhpcsLinter.create(executablePath);
-			this.ready = true;
-			this.validateMany(this.documents.all());
-		} catch (error) {
-			this.ready = false;
-			throw error;
-		}
-	}
-
-	/**
-	 * Initialize linter unless it is ready.
-	 */
-	private async initializeLinterUnlessReady() {
-		if (this.ready === false) {
-			await this.initializeLinter();
-		}
 	}
 
 	/**
@@ -219,16 +243,19 @@ class PhpcsServer {
 	 * @return void
 	 */
 	public async validateSingle(document: TextDocument): Promise<void> {
-		await this.initializeLinterUnlessReady();
-		if (this.ready === true && this.validating.has(document.uri) === false) {
-			this.sendStartValidationNotification(document);
-			let diagnostics = await this.linter.lint(document, this.settings).catch((error) => {
-				this.sendEndValidationNotification(document);
-				throw new Error(this.getExceptionMessage(error, document));
-			});
+		if (this.validating.has(document.uri) === false) {
+			let settings = await this.getDocumentSettings(document.uri);
+			if (settings.enable) {
+				this.sendStartValidationNotification(document);
+				let phpcs = await PhpcsLinter.create(settings.executablePath);
+				let diagnostics = await phpcs.lint(document, settings).catch((error) => {
+					this.sendEndValidationNotification(document);
+					throw new Error(this.getExceptionMessage(error, document));
+				});
 
-			this.sendEndValidationNotification(document);
-			this.sendDiagnostics({ uri: document.uri, diagnostics });
+				this.sendEndValidationNotification(document);
+				this.sendDiagnostics({ uri: document.uri, diagnostics });
+			}
 		}
 	}
 
